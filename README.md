@@ -56,8 +56,8 @@ Both scripts have a very detailed `--help` option, logging and in-script comment
 
 You can create an image with the next command:
 
-- Image on `${PWD}/disk.img`, mounted on `${PWD}/disk`, using `cmdipass` to retrieve the password with `'disk'` key in KeePass
-  and saving the easing script into `${HOME}/bin/disk`:
+- Image on `${PWD}/disk.img`, mounted on `${PWD}/disk`, using `cmdipass` to retrieve the password with `'disk'` key previously
+  created in KeePass and saving the easing script into `${HOME}/bin/disk`:
 
 ```
 crypt-disk-image-create --mount=disk -p "cmdipass get-one 'disk' --index=0 --password-only" -x $HOME/bin/disk disk.img
@@ -78,69 +78,72 @@ disk close
 
 # CAUTION!
 
-1. As the idea is to keep the image as small as possible (thin provisioned), it's needed to
-   allow `fstrim` to work all the way down from the contained filesystem down to the QCow2 image.
-   This leaks some information which some people may find an insecure decision. If you agree,
-   you'll probably prefer to don't thin provision and, then, don't use NBD with QCOW2 at all.
+### Thin provisioning, `fstrim` and information leaks
+As the idea is to keep the image as small as possible (thin provisioned), it's needed to
+allow `fstrim` to work all the way down from the contained filesystem down to the QCow2 image.
+This leaks some information which some people may find an insecure decision. If you agree,
+you'll probably prefer to don't thin provision and, then, don't use NBD with QCOW2 at all.
 
-   More: http://asalor.blogspot.com/2011/08/trim-dm-crypt-problems.html
+More: http://asalor.blogspot.com/2011/08/trim-dm-crypt-problems.html
 
-2. This script needs to be run as `root` to perform several actions. Some of those actions
-   might be insecure to perform over an untrusted image file. For example:
+### Root permissions
+This script needs to be run as `root` to perform several actions. Some of those actions
+might be insecure to perform over an untrusted image file. For example, from
+https://manpages.debian.org/testing/qemu-utils/qemu-nbd.8.en.html :
 
-       From https://manpages.debian.org/testing/qemu-utils/qemu-nbd.8.en.html :
-         "a malicious guest may have prepared the image to attempt to trigger kernel bugs in 
-         partition probing or file system mounting."
+    "a malicious guest may have prepared the image to attempt to trigger kernel bugs in
+    partition probing or file system mounting."
 
-   Some extra precautions have been taken when working with files and directories to mitigate
-   the fact this is beeing run by a user with sudo powers. However, those precautions would not
-   be enough (in general or in your particular case), so don't use it in untrusted environments.
+Some extra precautions have been taken when working with files and directories to mitigate
+the fact tt his is beeing run by a user with sudo powers. However, those precautions would not
+be enough (in general or in your particular case), so don't use it in untrusted environments.
 
-3. To open de LUKS device a password is needed. It's recommended to use a randomly generated one
-   at least 32 characters long (as with `pwgen -sy 32`). To ensure no password is stored in any
-   command prompt (visible in `/proc` and other places, like `top` or `ps`), the password is 
-   passed by pipe executing a command specified by `PW_CMD` argument. This command is executed by
-   the original owner (not root) using the sudo command.
+### Password store
+To open the LUKS device, a password is needed. It's recommended to use a randomly generated one
+at least 32 characters long (as with `pwgen -sy 32`). To ensure no password is stored in any
+command prompt (visible in `/proc` and other places, like `top` or `ps`), the password is
+passed by pipe executing a command specified by `PW_CMD` argument. This command is executed by
+the original owner (not root) using the `sudo` command.
 
-   It's recommended to use a password store to store and retrieve this password. You need to
-   create the password before creating or opening the crypted filesystem.
+It's recommended to use a password store to store and retrieve this password. You need to
+create the password before creating or opening the crypted filesystem.
 
-   - A very insecure example:
-     ```
-     echo "MyPassword"
-     ```
+- A very insecure example:
+  ```
+  echo "MyPassword"
+  ```
 
-   - An insecure example suitable for some orchestation environments, like Docker or Kubernetes:
-     ```
-     cat /run/secrets/my-password
-     ```
+- An insecure example suitable for some orchestation environments, like Docker or Kubernetes:
+  ```
+  cat /run/secrets/my-password
+  ```
 
-   - An example for `PW_CMD` connected to KeePass:
-     ```
-     cmdipass get-one "disk" --index=0 --password-only
-     ```
-     
-     `cmdipass` reads a password from an open KeePass using `http-connector` KeePass' plugin.
-     As it is executed with user's permissions (and not root), mitigates possible security problems.
-     KeePass needs to be unlocked and with the desired database active.
-     Looks for an entry named `disk`.
-     `cmdipass` will use user's config file.
-   
-   - Another example, with KWallet:
-     ```
-     kwalletcli -f "kwalletcli" -e "disks-documents"
-     ```
+- An example for `PW_CMD` connected to KeePass:
+  ```
+  cmdipass get-one "disk" --index=0 --password-only
+  ```
 
-   - Another example, using 'pass': https://www.passwordstore.org/
-     ```
-     pass "Disks/Documents"
-     ```
-   
-4. Use at your own risk!!
-   
-5. Use at your own risk!! Not kidding!
-   
-6. Use at your own risk!! Seriously!
+  `cmdipass` reads a password from an open KeePass using `http-connector` KeePass' plugin.
+  As it is executed with user's permissions (and not root), mitigates possible security problems.
+  KeePass needs to be unlocked and with the desired database active.
+  Looks for an entry named `disk`.
+  `cmdipass` will use user's config file.
+
+- Another example, with KWallet:
+  ```
+  kwalletcli -f "kwalletcli" -e "disks-documents"
+  ```
+
+- Another example, using 'pass': https://www.passwordstore.org/
+  ```
+  pass "Disks/Documents"
+  ```
+
+### Use at your own risk!!
+
+### Use at your own risk!! Not kidding!
+
+### Use at your own risk!! Seriously!
 
 # License
 The scripts and documentation in this project are released under the [GNU General Public License v3.0](https://github.com/emibcn/crypt-disk-image/blob/master/LICENSE).
