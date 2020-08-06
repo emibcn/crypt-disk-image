@@ -48,6 +48,17 @@ git clone https://github.com/emibcn/crypt-disk-image.git
 sudo cp crypt-disk-image/crypt-disk-image* /usr/local/bin/
 ```
 
+## Add it to `sudoers`
+
+As both scripts need to be run as root, you might want to allow this execution without password. For doing this, you can
+create a sudoer file like this in `/etc/sudoers.d/91-crypt-disk-image`:
+
+```
+# Allow mounting encrypted filesystem
+
+myuser ALL=(ALL) NOPASSWD: /usr/local/bin/crypt-disk-image, /usr/local/bin/crypt-disk-image-create
+```
+
 # Usage
 
 Both scripts have a very detailed `--help` option, logging and in-script comments. However, here are some basic examples:
@@ -63,7 +74,9 @@ You can create an image with the next command:
 crypt-disk-image-create --mount=disk -p "cmdipass get-one 'disk' --index=0 --password-only" -x $HOME/bin/disk disk.img
 ```
 
-The script outputs the commands that have to be executed in order to open or close the image which, in this case, will be:
+## Using an image
+
+The script above outputs the commands that have to be executed in order to open or close the image which, in this case, will be:
 
 ```
 # To open the image, considering that $HOME/bin is in user's PATH
@@ -74,17 +87,6 @@ ls -la disk/
 
 # To close the image
 disk close
-```
-
-## Add it to `sudoers`
-
-As both scripts need to be run as root, you might want to allow this execution without password. For doing this, you can
-create a sudoer file like this in `/etc/sudoers.d/91-crypt-disk-image`:
-
-```
-# Allow mounting encrypted filesystem
-
-myuser ALL=(ALL) NOPASSWD: /usr/local/bin/crypt-disk-image, /usr/local/bin/crypt-disk-image-create
 ```
 
 # CAUTION!
