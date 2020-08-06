@@ -1,0 +1,344 @@
+#!/bin/bash -e
+
+# Open and close a qemu image containing a crypted filesystem
+# The image is supposed to contain a LUKS crypted device with an Ext4 filesystem inside
+
+# Copyright (C) 2020 github.com/emibcn
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Used global variables
+CMD="${0##*/}"
+ARGS=( "${@}" )
+OWNER="${SUDO_USER:-${USER:-root}}"
+
+FILE=""
+MOUNT=""
+PW_CMD=""
+NBD=""
+SOCKET=""
+CRYPT=""
+
+function usage() {
+    cat <<EOT
+
+Opens or closes a qemu image containing a crypted filesystem.
+
+Usage: ${CMD} [OPCIÓ...] <FILE> <ACTION>
+
+Options:
+        -h|--help               Shows this help message.
+        -m|--mount MOUNT        Mount point for the filesystem (mandatory).
+        -p|--password PW_CMD    Use this command to obtain the password for crypted device (mandatory).
+
+        FILE                    Image filename (mandatory).
+	ACTION                  Action to perform: open, closei (mandatory).
+
+EOT
+}
+
+function log() {
+    local LEVEL="${1^^}"
+    shift
+    local MSG="$@"
+    local COLOR=""
+    local LEVEL_MSG="${LEVEL}"
+
+    local RED='\033[0;31m'
+    local GREEN='\033[0;32m'
+    local YELLOW='\033[0;33m'
+    local BLUE='\033[0;34m'
+    local NC='\033[0m' # No Color
+
+    case "${LEVEL}" in
+        INFO ) 
+            COLOR="${BLUE}"
+            ;;
+        ERROR|ERR )
+            COLOR="${RED}"
+            LEVEL_MSG="ERROR"
+            ;;
+        WARNING|WARN )
+            COLOR="${YELLOW}"
+            LEVEL_MSG="WARNING"
+            ;;
+        OK )
+            COLOR="${GREEN}"
+            ;;
+        * )
+            log error "Unknown log level: '${LEVEL}' for message '${MSG}'" >&2
+            return 1
+            ;;
+    esac
+
+    echo -e "${COLOR}[${LEVEL_MSG}] ${MSG}${NC}"
+}
+
+do_sudo_if_needed() {
+    if [ "${UID}" != 0 ]
+    then
+        log warn "User not root. Trying to sudo..."
+        exec sudo "$0" "${ARGS[@]}"
+    else
+        log ok "User root! Keep going..."
+    fi
+}
+
+function get_password() {
+    if ! sudo -u "${OWNER}" bash -ce "${PW_CMD}"
+    then
+        log error "Could not read disk password" >&2
+        exit 1
+    fi
+}
+
+parse_arguments() {
+    # Extract options and their arguments into variables.
+    local TEMP=$( getopt -o "hm:p:" --long "help,mount:,password:" --name "${CMD}" -- "${ARGS[@]}" )
+    eval set -- "${TEMP}"
+    
+    while true
+    do
+        case "${1}" in
+            -h|--help|? )
+                usage
+                exit 0
+                ;;
+            -m|--mount )
+                MOUNT="${2}"
+                shift
+                ;;
+            -p|--password )
+                PW_CMD="${2}"
+                shift
+                ;;
+            : )
+                log err "Invalid option: -${1} requires an argument" >&2
+                usage
+                exit 1
+                ;;
+            -- )
+                FILE="${2}"
+                ACTION="${3}"
+                shift
+                shift
+                break
+                ;;
+            * )
+                log err "Unknown option ${1}" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    
+        shift
+    done
+}
+
+#
+# Check if given/computed options are valid
+#
+check_owner_parent_and_exists() {
+    local FILE="$1"
+    local FILE_NAME="$2"
+
+    # Get FILE's parent directory owner
+    local PARENT_FILE_OWNER="$(stat -c %U "$(dirname "${FILE}" )" )"
+
+    if [ "${PARENT_FILE_OWNER}" != "${OWNER}" ]
+    then
+        log err "Parent directory of ${FILE_NAME} is not owned by '${OWNER}': '${FILE}' => '${PARENT_FILE_OWNER}'" >&2
+        exit 2
+    fi
+
+    # Check if FILE exists
+    if [ ! -a "${FILE}" ]
+    then
+        log err "${FILE_NAME} does not exists: '${FILE}'" >&2
+        exit 2
+    fi
+}
+
+check_arguments() {
+    # Check if mandatory arguments were given
+    if [ -z "${FILE}" ] || [ -z "${MOUNT}" ] || [ -z "${PW_CMD}" ]
+    then
+        log err "Arguments FILE, MOUNT and PW_CMD are mandatory" >&2
+        usage
+        exit 2
+    fi
+
+    # Check files and mountpoint parent directories owner and that does not exist
+    check_owner_parent_and_exists "${FILE}" "FILE"
+    check_owner_parent_and_exists "${MOUNT}" "MOUNT"
+}
+
+function detect_nbd() {
+    local OPEN_NBD="$( ps x | grep qemu-nbd | grep -v grep | sed -e 's#^.* --socket [^0-9]*\([^ ]*\) \(.*\)$#\1 \2#' )"
+
+    # Find a running NBD process associated with the desired image
+    # Here, the last grep is for getting a return value of 0/1 when results are/aren't found
+    if ! echo "${OPEN_NBD}" | grep "${FILE}" | awk '{print $1}' | xargs -i echo '/dev/nbd{}' | grep /dev/nbd
+    then
+        # If none is found, list all running NBD instances (might be an empty list),
+        # get the last's number (again, might be empty) and sum 1 to it.
+        # Finally, print the resulting device
+        local LAST_NBD="$( echo "${OPEN_NBD}" | awk '{print $1}' | sort -n | tail -1 )"
+        echo "/dev/nbd$(( LAST_NBD + 1 ))"
+    fi
+}
+
+function open_device() {
+    log info "Load kernel module 'nbd'..."
+
+    # If we need to load the kernel module, add a 1 second delay to prevent some race conditions
+    lsmod | grep nbd > /dev/null 2>&1 \
+        && log ok "Kernel module already loaded" \
+        || modprobe nbd max_part=63 \
+	&& sleep 1
+
+    # ALTERNATIVE to autoreconnect after suspend:
+    # https://sourceforge.net/p/nbd/mailman/nbd-general/thread/W9885015784262871379700043%40atl4webmail25/
+    #
+    # But using Unix socket instead of TCP
+    log info "Map file '${FILE}' to socket '${SOCKET}'..."
+    if ls "${SOCKET}" > /dev/null 2>&1
+    then
+        log ok "NBD already connected '${FILE}' to '${SOCKET}'"
+    else
+	# --persitent: re-connect after suspend
+	# --discard=unmap: allow fstrim to work (thin provisioning)
+	# --fork: run service in background
+	# --socket X: serve through unix socket X
+        qemu-nbd --persistent --discard=unmap --fork --socket "${SOCKET}" "${FILE}"
+    fi
+
+    log info "Map socket '${SOCKET}' to device '${NBD}'..."
+    if nbd-client -c "${NBD}" > /dev/null 2>&1
+    then
+        log ok "NBD already connected '${SOCKET}' to '${NBD}'"
+    else
+	# -persist: reconnect after suspend
+	# -unix X: connect to server's unix socket X
+        nbd-client -persist -unix "${SOCKET}" "${NBD}"
+    fi
+
+    # --allow-discards: allow fstrim to work properly
+    log info "Open crypted device '${CRYPT}'..."
+    ls "${CRYPT}" > /dev/null 2>&1 \
+        && log ok "Decrypted image already opened as '${CRYPT}'" \
+        || get_password | cryptsetup -v --allow-discards luksOpen "${NBD}" "${CRYPT##*/}"
+
+    log info "Mount filesystem to '${MOUNT}'..."
+    if mount | grep "${CRYPT}" > /dev/null 2>&1
+    then
+        log ok "Decrypted image already mounted at '${MOUNT}'"
+    else
+	# Check filesystem consistency and correct obvious problems
+        local ERR=0
+        fsck.ext4 -v -y -f "${CRYPT}" \
+            || ERR=$?
+
+        # From `man fsck.ext4`:
+        #   The exit code returned by e2fsck is the sum of the following conditions:
+        #     0    - No errors
+        #     1    - File system errors corrected
+        #     2    - File system errors corrected, system should
+        #            be rebooted
+        #     4    - File system errors left uncorrected
+        #     8    - Operational error
+        #     16   - Usage or syntax error
+        #     32   - E2fsck canceled by user request
+        #     128  - Shared library error
+
+        if [ "${ERR}" -gt 2 ]
+        then
+            log error "Checking filesystem: ${ERR}" >&2
+            exit 2
+        fi
+
+	# Mount the filesystem and free unused space
+        mount "${CRYPT}" "${MOUNT}"
+        fstrim -v "${MOUNT}"
+    fi
+}
+
+function close_device() {
+    log info "Unmount filesystem at '${MOUNT}'..."
+    if mount | grep "${CRYPT}" > /dev/null 2>&1
+    then
+        umount "${MOUNT}"
+    else
+        log ok "Filesystem already unmounted"
+    fi
+    
+    log info "Close crypted device '${CRYPT}'..."
+    if ls "${CRYPT}" > /dev/null 2>&1
+    then
+        cryptsetup luksClose "${CRYPT}"
+    else
+        log ok "Decrypted image already closed"
+    fi
+
+    log info "Unmap device '${NBD}'..."
+    if nbd-client -c "${NBD}" > /dev/null 2>&1
+    then
+        nbd-client -d "${NBD}"
+    else
+        log ok "NBD device already disconnected from socket"
+    fi
+
+    log info "Disconnect file from socket '${SOCKET}'..."
+    if ls "${SOCKET}" > /dev/null 2>&1
+    then
+	# Find a qemu-nbd process mapping to our SOCKET and send a TERM signal by PID
+	# TODO: We can grab qemu-nbd PID into a /run/ tmp file with `--pid-file=PATH`
+        ps x | grep 'qemu-nbd ' | grep "${SOCKET}" | awk '{print $1}' | xargs kill -TERM
+    else
+        log ok "NBD socket already disconnected from file"
+    fi
+
+    log info "Unload kernel module 'nbd'..."
+    if lsmod | grep nbd > /dev/null 2>&1
+    then
+        rmmod nbd || log warn "Maybe there are other NBD devices connected?"
+    else
+        log ok "Kernel module already unloaded"
+    fi
+}
+
+#
+# Main
+#
+
+do_sudo_if_needed
+parse_arguments
+
+NBD="$( detect_nbd )"
+CRYPT="/dev/mapper/${NBD##*/}crypt"
+SOCKET="/run/lock/qemu-nbd-${NBD##*/}"
+
+case "${ACTION}" in
+    open )
+        open_device
+        ;;
+    close )
+        close_device
+        ;;
+    * )
+        log error "Unknown ACTION: '${ACTION}'. Valid values: open, close" >&2
+        exit 1
+        ;;
+esac
+

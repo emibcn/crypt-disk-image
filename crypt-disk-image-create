@@ -1,0 +1,353 @@
+#!/bin/bash -e
+
+# Creates a qemu image containing a crypted filesystem
+
+# Copyright (C) 2020 github.com/emibcn
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Used global variables
+CMD="${0##*/}"
+ARGS=( "${@}" )
+OWNER="${SUDO_USER:-${USER:-root}}"
+
+SIZE="100G"
+NBD="nbd11"
+MOUNT=""
+KEY=""
+FILE=""
+PW_CMD=""
+SCRIPT=""
+CHECK_DEPS="0"
+
+function usage() {
+    cat <<EOT
+
+Creates a file as QCOW2 thin provisioned image, containing a crypted (cryptsetup) Ext4 filesystem
+
+Use: ${CMD} [OPTIONS...] <FILE>
+
+Opcions:
+        -h|--help               Shows this help message.
+        -c|--check-deps         Check if all dependencies are met.
+        -s|--size SIZE          Maximum size of the file (default: '${SIZE}').
+        -m|--mount MOUNT        Mount point for the filesystem (mandatory).
+        -n|--nbd NBD            NBD device to use during creation (default: '${NBD}').
+        -o|--owner OWNER        Owner for  the file, the filesystem, the mountpoint and the generated script (default: '${OWNER}').
+        -p|--password PW_CMD    Use this command to obtain the password for crypted device (mandatory).
+        -x|--script SCRIPT      Save open/close script to this file (mandatory).
+
+        FILE                    Image filename to create (mandatory).
+
+EOT
+}
+
+function log() {
+    local LEVEL="${1^^}"
+    shift
+    local MSG="$@"
+    local COLOR=""
+    local LEVEL_MSG="${LEVEL}"
+
+    local RED='\033[0;31m'
+    local GREEN='\033[0;32m'
+    local YELLOW='\033[0;33m'
+    local BLUE='\033[0;34m'
+    local NC='\033[0m' # No Color
+
+    case "${LEVEL}" in
+        INFO ) 
+            COLOR="${BLUE}"
+            ;;
+        ERROR|ERR )
+            COLOR="${RED}"
+            LEVEL_MSG="ERROR"
+            ;;
+        WARNING|WARN )
+            COLOR="${YELLOW}"
+            LEVEL_MSG="WARNING"
+            ;;
+        OK )
+            COLOR="${GREEN}"
+            ;;
+        * )
+            log error "Unknown log level: '${LEVEL}' for message '${MSG}'" >&2
+            return 1
+            ;;
+    esac
+
+    echo -e "${COLOR}[${LEVEL_MSG}] ${MSG}${NC}"
+}
+
+check_dependencies() {
+    local FOUND_ERROR="0"
+    local DEPENDENCIES=( sudo qemu-img qemu-nbd nbd-client cryptsetup mkfs.ext4 fsck.ext4 fstrim )
+
+    for DEP in ${DEPENDENCIES}
+    do
+        if ! command -v "${DEP}" > /dev/null 2>&1
+        then
+            log err "Dependency '${DEP}' not found." >&2
+            FOUND_ERROR="1"
+        fi
+    done
+
+    if [ "${FOUND_ERROR}" = "1" ]
+    then
+        log err "Install missing dependencies." >&2
+        exit 3
+    else
+        log ok "All dependencies are met."
+    fi
+}
+
+do_sudo_if_needed() {
+    if [ "${UID}" != 0 ]
+    then
+        log warn "User not root. Trying to sudo..."
+        exec sudo "$0" "${ARGS[@]}"
+    else
+        log ok "User root! Keep going..."
+    fi
+}
+
+function get_password() {
+    if ! sudo -u "${OWNER}" bash -ce "${PW_CMD}"
+    then
+        log error "Could not read disk password" >&2
+        exit 1
+    fi
+}
+
+parse_arguments() {
+    # Extract options and their arguments into variables.
+    local TEMP=$( getopt -o "hcs:m:n:o:p:x:" --long "help,check-deps,size:,mount:,nbd:,owner:,password:,script:" --name "${CMD}" -- "${ARGS[@]}" )
+    eval set -- "${TEMP}"
+    
+    while true
+    do
+        case "${1}" in
+            -h|--help|? )
+                usage
+                exit 0
+                ;;
+            -c|--check-deps )
+                CHECK_DEPS="1"
+                check_dependencies
+                exit 0
+                ;;
+            -s|--size )
+                SIZE="${2}"
+                shift
+                ;;
+            -m|--mount )
+		MOUNT="$( readlink -f "${2}" )"
+                shift
+                ;;
+            -n|--nbd )
+                NBD="${2}"
+                shift
+                ;;
+            -o|--owner )
+		if [ "${OWNER}" = "root" ] || [ "${OWNER}" = "${2}" ]
+		then
+                    OWNER="${2}"
+		else
+		    log err "Only root can choose a different owner"
+		    exit 1
+		fi
+
+                shift
+                ;;
+            -p|--password )
+                PW_CMD="${2}"
+                shift
+                ;;
+            -x|--script )
+                SCRIPT="${2}"
+                shift
+                ;;
+            : )
+                log err "Invalid option: -${1} requires an argument" >&2
+                usage
+                exit 1
+                ;;
+            -- )
+                FILE="$( readlink -f "${2}" )"
+                shift
+                break
+                ;;
+            * )
+                log err "Unknown option ${1}" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    
+        shift
+    done
+
+    # Set variables derived from $NBD
+    DEV="/dev/${NBD}"
+    DEV_CRYPT="/dev/mapper/${NBD}crypt"
+}
+
+#
+# Check if given/computed options are valid
+#
+check_owner_parent_and_not_exists() {
+    local FILE="$1"
+    local FILE_NAME="$2"
+
+    # Get FILE's parent directory owner
+    local PARENT_FILE_OWNER="$(stat -c %U "$(dirname "${FILE}" )" )"
+
+    if [ "${PARENT_FILE_OWNER}" != "${OWNER}" ]
+    then
+        log err "Parent directory of ${FILE_NAME} is not owned by '${OWNER}': '${FILE}' => '${PARENT_FILE_OWNER}'" >&2
+        exit 2
+    fi
+
+    # Check if FILE exists
+    if [ -a "${FILE}" ]
+    then
+        log err "${FILE_NAME} already exists: '${FILE}'" >&2
+        exit 2
+    fi
+}
+
+check_arguments() {
+    # Check if mandatory arguments were given
+    if [ -z "${FILE}" ] || [ -z "${MOUNT}" ] || [ -z "${SCRIPT}" ] || [ -z "${PW_CMD}" ]
+    then
+        log err "Arguments FILE, MOUNT, SCRIPT and PW_CMD are mandatory" >&2
+        usage
+        exit 2
+    fi
+
+    # Check files and mountpoint parent directories owner and that does not exist
+    check_owner_parent_and_not_exists "${FILE}" "FILE"
+    check_owner_parent_and_not_exists "${MOUNT}" "MOUNT"
+    check_owner_parent_and_not_exists "${SCRIPT}" "SCRIPT"
+    
+    # Check NBD and crypt devices
+    if nbd-client -c "${DEV}" > /dev/null 2>&1
+    then
+        log err "NBD device already in use: '${DEV}'" >&2
+        exit 2
+    fi
+    if [ ! -b "${DEV}" ]
+    then
+        log err "NBD device not found or not a block device: '${DEV}'" >&2
+        exit 2
+    fi
+    if [ -e "${DEV_CRYPT}" ]
+    then
+        log err "Crypted device already exists: '${DEV_CRYPT}'" >&2
+        exit 2
+    fi
+    
+    # Check if password is long enough
+    PW_LONG="$( get_password | wc -c )"
+    if [ "${PW_LONG}" -lt "32" ]
+    then
+        log err "Password too short (${PW_LONG}). Use a longer password."
+        exit 2
+    fi
+}
+
+create_image_file() {
+    log info "Create image file with QCOW2 format"
+    qemu-img create -f qcow2 "${FILE}" -o size=${SIZE},preallocation=metadata
+    
+    log info "Load nbd kernel module"
+    modprobe nbd max_part=63 \
+        || lsmod | grep nbd > /dev/null 2>&1
+    
+    # Start service in background
+    log info "Map image file to a device using qemu-nbd"
+    qemu-nbd -v -c "${DEV}" "${FILE}" &
+    
+    log info "Format device as a crypted device"
+    get_password \
+        | cryptsetup \
+            --cipher aes-xts-plain \
+            --key-size 512 \
+            --hash sha512 \
+            -v luksFormat "${DEV}"
+    
+    log info "Open crypted device"
+    get_password \
+        | cryptsetup \
+            -v luksOpen "${DEV}" "${DEV_CRYPT##*/}"
+    
+    log info "Make filesystem on crypted device"
+    mkfs.ext4 "${DEV_CRYPT}"
+    
+    log info "Create mountpoint and chown to owner"
+    mkdir -v "${MOUNT}"
+    chown -v ${OWNER}: "${MOUNT}"
+    
+    log info "Mount filesystem into mountpoint"
+    mount -v "${DEV_CRYPT}" "${MOUNT}"
+    
+    log info "Chown image and filesystem contents to specified owner"
+    chown -vR ${OWNER}: "${FILE}" "${MOUNT}"
+}    
+
+clean_image_file() {
+    log info "Unmount filesystem"
+    umount -v "${MOUNT}"
+    
+    log info "Close crypted device"
+    cryptsetup -v luksClose "${DEV_CRYPT}"
+    
+    log info "Unmap file to NBD device (kill backgrounded qemu-nbd job)"
+    kill %1
+}
+
+create_script() {
+    log info "Create open/close script ${SCRIPT}"
+    cat <<EOT > "${SCRIPT}"
+#!/bin/bash -e
+exec crypt-disk-image -m "${MOUNT}" -p "${PW_CMD}" "${FILE}" "\${@}"
+EOT
+    chown ${OWNER}: "${SCRIPT}"
+    chmod +x "${SCRIPT}"
+
+    log info "Run following script to open '${FILE}', decrypt and mount into '${MOUNT}':"
+    log info "$ ${SCRIPT} open"
+
+    echo ''
+    log info "Run following script to close '${FILE}' and unmount from '${MOUNT}':"
+    log info "$ ${SCRIPT} close"
+}
+
+#
+# Main
+#
+
+do_sudo_if_needed
+parse_arguments
+
+if [ "${CHECK_DEPS}" = "1" ]
+then
+    check_dependencies
+    exit 0
+fi
+
+check_arguments
+create_image_file
+clean_image_file
+create_script
