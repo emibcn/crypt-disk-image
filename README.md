@@ -76,13 +76,24 @@ ls -la disk/
 disk close
 ```
 
+## Add it to `sudoers`
+
+As both scripts need to be run as root, you might want to allow this execution without password. For doing this, you can
+create a sudoer file like this in `/etc/sudoers.d/91-crypt-disk-image`:
+
+```
+# Allow mounting encrypted filesystem
+
+myuser ALL=(ALL) NOPASSWD: /usr/local/bin/crypt-disk-image, /usr/local/bin/crypt-disk-image-create
+```
+
 # CAUTION!
 
 ### Thin provisioning, `fstrim` and information leaks
 As the idea is to keep the image as small as possible (thin provisioned), it's needed to
-allow `fstrim` to work all the way down from the contained filesystem down to the QCow2 image.
+allow `fstrim` to work all the way from the contained filesystem down to the QCow2 image.
 This leaks some information which some people may find an insecure decision. If you agree,
-you'll probably prefer to don't thin provision and, then, don't use NBD with QCOW2 at all.
+you'll probably prefer to don't thin provision and, then, don't use NBD with QCow2 at all.
 
 More: http://asalor.blogspot.com/2011/08/trim-dm-crypt-problems.html
 
@@ -95,7 +106,8 @@ https://manpages.debian.org/testing/qemu-utils/qemu-nbd.8.en.html :
     partition probing or file system mounting."
 
 Some extra precautions have been taken when working with files and directories to mitigate
-the fact tt his is beeing run by a user with sudo powers. However, those precautions would not
+the fact that this is beeing run by a user with sudo powers, for example, only create files
+and directories under a directory owned by the user. However, those precautions would not
 be enough (in general or in your particular case), so don't use it in untrusted environments.
 
 ### Password store
