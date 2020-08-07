@@ -51,7 +51,7 @@ sudo cp crypt-disk-image/crypt-disk-image* /usr/local/bin/
 ## Add it to `sudoers`
 
 As both scripts need to be run as root, you might want to allow this execution without password. For doing this, you can
-create a sudoer file like this in `/etc/sudoers.d/91-crypt-disk-image`:
+create a sudoer file like this with `visudo /etc/sudoers.d/91-crypt-disk-image`:
 
 ```
 # Allow mounting encrypted filesystem
